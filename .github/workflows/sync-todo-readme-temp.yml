@@ -1,0 +1,164 @@
+name: sync-todo-readme-temp
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout dev with full history
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Update README TODO section
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import collections, os, re, subprocess, sys
+
+          REPO = "."
+          README = "README.md"
+          HEADING = "### 📝 Complete TODO List"
+          SUFFIX_HEADING = "## 🤝 Contributing"
+          BULLET_RE = re.compile(r"^- \[ \] \*\*(?P<path>.+?):(?P<line>\d+)\*\* - (?P<msg>.*)$")
+          # Comments such as "# TODO: xxx" or "# TODO(whoever) xxx"
+          TODO_RE = re.compile(r"#\s*TODO\b[ \t]*(?::[ \t]*)?(.*?)\s*$")
+
+          old_readme = open(README, encoding="utf-8").read()
+          h_start = old_readme.index(HEADING)
+          suffix_idx = old_readme.index("\n" + SUFFIX_HEADING, h_start)
+          section_text = old_readme[h_start:suffix_idx]
+          old_bullets = [ln for ln in section_text.splitlines() if ln.startswith("- [ ]")]
+
+          # Parse baseline bullets and preserve exact raw text per (path, message) group order.
+          groups = collections.OrderedDict()
+          for raw in old_bullets:
+              m = BULLET_RE.match(raw)
+              assert m, f"bad baseline bullet: {raw!r}"
+              groups.setdefault(m.group("path"), []).append(raw)
+
+          changed = subprocess.check_output(
+              ["git", "diff", "--name-only", "origin/main", "origin/dev"], text=True
+          ).split()
+          changed_py = {p for p in changed if p.endswith(".py")}
+          print("Changed files main..dev:", changed)
+          print("Changed python files:", sorted(changed_py))
+
+          def scan_todos(path):
+              found = []
+              with open(path, encoding="utf-8", errors="replace") as fh:
+                  for no, line in enumerate(fh, 1):
+                      if "TODO" not in line:
+                          continue
+                      mm = TODO_RE.search(line)
+                      if not mm:
+                          continue
+                      msg = re.sub(r"\s+", " ", mm.group(1).strip())
+                      found.append((no, msg))
+              return found
+
+          scanned = {}
+          all_py = subprocess.check_output(["git", "ls-files", "*.py"], text=True).split()
+          for p in all_py:
+              scanned[p] = scan_todos(p)
+
+          old_by_path = {p: [BULLET_RE.match(b).groupdict() for b in bs] for p, bs in groups.items()}
+
+          # Warnings (non blocking) for drift in files that did NOT change main..dev.
+          warn = []
+          for p, old_entries in old_by_path.items():
+              if p in changed_py:
+                  continue
+              got = len(scanned.get(p, []))
+              want = len(old_entries)
+              if got != want:
+                  warn.append(f"count mismatch unchanged file {p}: scan={got} bullets={want}")
+
+          new_groups = collections.OrderedDict(groups)
+          for p in sorted(changed_py):
+              if p not in scanned:
+                  continue
+              bullets = []
+              for no, msg in sorted(scanned[p], key=lambda x: x[0]):
+                  bullets.append(f"- [ ] **{p}:{no}** - {msg}")
+              new_groups[p] = bullets
+
+          # Add any brand-new python path not represented in baseline, lex ordered by path.
+          known = set(groups)
+          for p in sorted(scanned):
+              if p not in known and scanned[p]:
+                  bullets = [f"- [ ] **{p}:{no}** - {msg}" for no, msg in sorted(scanned[p], key=lambda x: x[0])]
+                  if p not in new_groups:
+                      updated = collections.OrderedDict()
+                      inserted = False
+                      for existing in list(new_groups):
+                          if not inserted and p < existing:
+                              updated[p] = bullets
+                              inserted = True
+                          updated[existing] = new_groups[existing]
+                      if not inserted:
+                          updated[p] = bullets
+                      new_groups = updated
+
+          # Validate unchanged bullets byte-for-byte preserved.
+          for p, raw_list in groups.items():
+              if p not in changed_py:
+                  assert new_groups[p] == raw_list, f"unchanged bullets altered for {p}"
+
+          new_bullets = []
+          for p, bullets in new_groups.items():
+              parsed = [BULLET_RE.match(b).groupdict() for b in bullets]
+              lines = [int(x["line"]) for x in parsed]
+              assert lines == sorted(lines), f"lines not increasing for {p}: {lines}"
+              new_bullets.extend(bullets)
+
+          # Global lexicographic (path asc, then line asc) validation.
+          keys = [(BULLET_RE.match(b).group("path"), int(BULLET_RE.match(b).group("line"))) for b in new_bullets]
+          assert keys == sorted(keys), "global bullet ordering invalid"
+
+          old_count, new_count = len(old_bullets), len(new_bullets)
+          old_key = {(BULLET_RE.match(b).group("path"), BULLET_RE.match(b).group("msg")) for b in old_bullets}
+          new_key = {(BULLET_RE.match(b).group("path"), BULLET_RE.match(b).group("msg")) for b in new_bullets}
+          print(f"Baseline bullets={old_count}; New bullets={new_count}")
+          print("Removed bullets:")
+          for k in sorted(old_key - new_key):
+              print("  -", k[0], "::", k[1])
+          print("Added bullets:")
+          for k in sorted(new_key - old_key):
+              print("  +", k[0], "::", k[1])
+          print("Warnings:", warn if warn else "none")
+
+          new_section = HEADING + "\n\n" + "\n".join(new_bullets) + "\n\n"
+          new_readme = old_readme[:h_start] + new_section + old_readme[suffix_idx:]
+          assert HEADING in new_readme
+          open(README, "w", encoding="utf-8").write(new_readme)
+          print("README regeneration finished without invariant violations")
+          PY
+
+      - name: Commit and push when README changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add README.md
+          if git diff --cached --quiet; then
+            echo "No README changes to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "docs: sync Complete TODO List with dev TODO markers"
+          git push origin HEAD:dev
+          echo "PUSHED=yes" >> "$GITHUB_OUTPUT"
